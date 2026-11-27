@@ -1183,41 +1183,32 @@ export default class FloatingNotePlugin extends Plugin {
     });
   }
 
-  private registerGlobalShortcut() {
+  private registerGlobalShortcut(accelerator = this.settings.globalShortcut.trim()): boolean {
+    const previous = this.registeredGlobalShortcut;
+    if (accelerator === (previous ?? "")) return true;
+
     const globalShortcut = this.getGlobalShortcutModule();
-    const accelerator = this.settings.globalShortcut.trim();
-
-    if (!globalShortcut) {
-      this.registeredGlobalShortcut = null;
-      return;
+    if (globalShortcut && accelerator) {
+      try {
+        if (!globalShortcut.register(accelerator, () => {
+          this.debugLog("globalShortcut:triggered", { accelerator });
+          void this.openFloatingNote(false, "global");
+        })) {
+          new Notice(`Could not register "${accelerator}". It may already be in use.`);
+          return false;
+        }
+      } catch {
+        new Notice(`Could not register "${accelerator}". Try a different shortcut.`);
+        return false;
+      }
+    } else if (accelerator) {
+      new Notice("System-wide shortcut registration is unavailable.");
+      return false;
     }
 
-    const previousAccelerator = this.registeredGlobalShortcut;
-    if (previousAccelerator) {
-      globalShortcut.unregister(previousAccelerator);
-    }
-    this.registeredGlobalShortcut = null;
-
-    if (!accelerator) {
-      return;
-    }
-
-    globalShortcut.unregister(accelerator);
-
-    const wasRegistered = globalShortcut.register(accelerator, () => {
-      this.debugLog("globalShortcut:triggered", { accelerator });
-      void this.openFloatingNote(false, "global");
-    });
-
-    if (!wasRegistered) {
-      new Notice(
-        `Could not register global shortcut "${accelerator}". It may already be in use.`,
-        5000
-      );
-      return;
-    }
-
-    this.registeredGlobalShortcut = accelerator;
+    if (previous) globalShortcut?.unregister(previous);
+    this.registeredGlobalShortcut = accelerator || null;
+    return true;
   }
 
   private getLeafId(leaf: WorkspaceLeaf | null) {
@@ -1259,10 +1250,13 @@ export default class FloatingNotePlugin extends Plugin {
     this.registeredGlobalShortcut = null;
   }
 
-  async updateGlobalShortcut(value: string) {
-    this.settings.globalShortcut = value.trim();
+  async updateGlobalShortcut(value: string): Promise<boolean> {
+    const accelerator = value.trim();
+    if (!this.registerGlobalShortcut(accelerator)) return false;
+
+    this.settings.globalShortcut = accelerator;
     await this.saveSettings();
-    this.registerGlobalShortcut();
+    return true;
   }
 
   private async createNewQuickNote(): Promise<TFile | null> {
@@ -1592,7 +1586,7 @@ export class FloatingNoteSettingTab extends PluginSettingTab {
           },
           {
             name: "Global shortcut",
-            desc: 'Electron accelerator that toggles the reusable quick note from any app. Use values like Ctrl+` or Cmd+Shift+Space. Leave blank to disable.',
+            desc: 'Toggle the reusable quick note from any app. Click the shortcut to record a new one. Press Escape to cancel.',
             render: (setting: Setting) => this.renderGlobalShortcut(setting),
           },
           {
@@ -1635,15 +1629,97 @@ export class FloatingNoteSettingTab extends PluginSettingTab {
   }
 
   private renderGlobalShortcut(setting: Setting): void {
-    setting
-      .addText((text) =>
-        text
-          .setPlaceholder("Ctrl+`")
-          .setValue(this.plugin.settings.globalShortcut)
-          .onChange(async (value) => {
-            await this.plugin.updateGlobalShortcut(value);
-          })
-      );
+    const currentLabel = () => this.plugin.settings.globalShortcut || "Record shortcut";
+    let recording = false;
+    let refreshLabel: (() => void) | undefined;
+    const saveShortcut = async (accelerator: string) => {
+      try {
+        await this.plugin.updateGlobalShortcut(accelerator);
+      } catch {
+        new Notice("Could not save the system-wide shortcut.");
+      } finally {
+        refreshLabel?.();
+      }
+    };
+
+    setting.addButton((record) => {
+      record.setButtonText(currentLabel()).setTooltip("Record system-wide shortcut");
+      const stopRecording = () => {
+        recording = false;
+        record.setButtonText(currentLabel());
+      };
+
+      refreshLabel = stopRecording;
+
+      record.onClick(() => {
+        recording = true;
+        record.setButtonText("Press shortcut…");
+        record.buttonEl.focus();
+      });
+      record.buttonEl.addEventListener("blur", stopRecording);
+      record.buttonEl.addEventListener("keydown", (event) => {
+        if (!recording || event.key === "Tab") return;
+
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.key === "Escape") {
+          stopRecording();
+          return;
+        }
+        if (event.repeat || event.isComposing) return;
+
+        const accelerator = this.getRecordedAccelerator(event);
+        if (!accelerator) return;
+
+        stopRecording();
+        void saveShortcut(accelerator);
+      });
+    });
+    setting.addButton((clear) => clear.setButtonText("Clear").onClick(() => saveShortcut("")));
+  }
+
+  private getRecordedAccelerator(event: KeyboardEvent): string | null {
+    const modifiers: string[] = [];
+    if (event.metaKey) modifiers.push("Command");
+    if (event.ctrlKey) modifiers.push("Ctrl");
+    if (event.altKey) modifiers.push("Alt");
+    if (event.shiftKey) modifiers.push("Shift");
+
+    const namedKeys: Record<string, string> = {
+      " ": "Space",
+      ArrowUp: "Up",
+      ArrowDown: "Down",
+      ArrowLeft: "Left",
+      ArrowRight: "Right",
+      "+": "Plus",
+    };
+    const punctuationByCode: Record<string, string> = {
+      Backquote: "`",
+      Minus: "-",
+      Equal: "=",
+      BracketLeft: "[",
+      BracketRight: "]",
+      Backslash: "\\",
+      Semicolon: ";",
+      Quote: "'",
+      Comma: ",",
+      Period: ".",
+      Slash: "/",
+    };
+    let key = namedKeys[event.key] ?? event.key;
+    if ((event.altKey || event.shiftKey) && !/^[a-z0-9]$/i.test(event.key)) {
+      const letterOrDigit = /^(?:Key([A-Z])|Digit([0-9]))$/.exec(event.code);
+      key = letterOrDigit?.[1] ?? letterOrDigit?.[2] ?? punctuationByCode[event.code] ?? key;
+    }
+    const isSingleKey = /^[a-z0-9]$/i.test(key) ||
+      Object.values(punctuationByCode).includes(key);
+    const isNamedKey = Object.values(namedKeys).includes(key) ||
+      /^(?:F(?:[1-9]|1[0-9]|2[0-4])|Enter|Backspace|Delete|Insert|Home|End|PageUp|PageDown)$/.test(key);
+    if (!isSingleKey && !isNamedKey) {
+      return null;
+    }
+
+    return [...modifiers, key.length === 1 ? key.toUpperCase() : key].join("+");
   }
 
   private renderExtraReusableNotePaths(setting: Setting): void {
@@ -1696,7 +1772,7 @@ export class FloatingNoteSettingTab extends PluginSettingTab {
           })
       );
 
-    this.renderGlobalShortcut(new Setting(containerEl).setName("Global shortcut").setDesc('Electron accelerator that toggles the reusable quick note from any app. Use values like Ctrl+` or Cmd+Shift+Space. Leave blank to disable.'));
+    this.renderGlobalShortcut(new Setting(containerEl).setName("Global shortcut").setDesc('Toggle the reusable quick note from any app. Click the shortcut to record a new one. Press Escape to cancel.'));
 
     new Setting(containerEl)
       .setName("Default note content")

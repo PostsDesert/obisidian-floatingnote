@@ -25,7 +25,7 @@ You can find the settings for this plugin under **Settings -> Floating Quick Not
 
 - **Notes folder**: Where new quick notes are stored.
 - **Title format**: How new quick notes are named.
-- **Global shortcut**: A system-wide accelerator that toggles the reusable floating note.
+- **Global shortcut**: Click the current shortcut or **Record shortcut**, then press the key combination you want to use from any app. Press Escape to cancel or click **Clear** to disable it.
 - **Default content**: What text should be in a new note by default.
 - **Additional reusable notes**: Extra vault-relative note paths to open alongside the main reusable note.
 - **Always on top**: Whether the window should stay above other apps.

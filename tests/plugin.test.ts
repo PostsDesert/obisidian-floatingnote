@@ -5,7 +5,7 @@
  * run in plain Node without any browser or Obsidian runtime.
  */
 
-import { App, moment, TFile, WorkspaceLeaf } from "obsidian";
+import { App, moment, TFile, WorkspaceLeaf, type ButtonComponent, type Setting } from "obsidian";
 import { app as electronApp, globalShortcut, remote, mockWin, screen } from "../__mocks__/electron";
 
 // We import the plugin class *after* jest module mocks are in place.
@@ -301,7 +301,6 @@ describe("onload", () => {
 
         await plugin.onload();
 
-        expect(globalShortcut.unregister).toHaveBeenCalledWith("Ctrl+`");
         expect(globalShortcut.register).toHaveBeenCalledWith("Ctrl+`", expect.any(Function));
         expect(getWorkspace(plugin.app).on).toHaveBeenCalledWith(
             "window-close",
@@ -328,7 +327,6 @@ describe("updateGlobalShortcut", () => {
         await plugin.updateGlobalShortcut("Ctrl+Shift+Space");
 
         expect(globalShortcut.unregister).toHaveBeenCalledWith("Ctrl+`");
-        expect(globalShortcut.unregister).toHaveBeenCalledWith("Ctrl+Shift+Space");
         expect(globalShortcut.register).toHaveBeenLastCalledWith(
             "Ctrl+Shift+Space",
             expect.any(Function)
@@ -336,17 +334,74 @@ describe("updateGlobalShortcut", () => {
         expect(plugin.settings.globalShortcut).toBe("Ctrl+Shift+Space");
     });
 
-    it("reclaims the configured shortcut even when no prior registration is tracked", async () => {
+    it("preserves the current shortcut when the new combo is taken", async () => {
+        const plugin = makePlugin();
+        await plugin.onload();
+        globalShortcut.register.mockReturnValue(false);
+        const save = jest.spyOn(plugin, "saveData");
+
+        await expect(plugin.updateGlobalShortcut("Ctrl+Shift+Space")).resolves.toBe(false);
+
+        expect(globalShortcut.unregister).not.toHaveBeenCalled();
+        expect(plugin.settings.globalShortcut).toBe("Ctrl+`");
+        expect(save).not.toHaveBeenCalled();
+    });
+
+    it("clears the registered shortcut", async () => {
+        const plugin = makePlugin();
+        await plugin.onload();
+
+        await expect(plugin.updateGlobalShortcut("")).resolves.toBe(true);
+
+        expect(globalShortcut.unregister).toHaveBeenCalledWith("Ctrl+`");
+        expect(plugin.settings.globalShortcut).toBe("");
+    });
+});
+
+describe("system-wide shortcut recorder", () => {
+    it("records a key combo and lets Escape cancel another recording", async () => {
         const plugin = makePlugin();
         await plugin.loadSettings();
+        const update = jest.spyOn(plugin, "updateGlobalShortcut").mockResolvedValue(true);
+        const tab = new FloatingNoteSettingTab(plugin.app, plugin);
+        const row = tab.getSettingDefinitions()[0].items.find(item => item.name === "Global shortcut");
+        if (!row || !("render" in row) || !row.render) throw new Error("Missing global shortcut setting");
 
-        await plugin.updateGlobalShortcut("Ctrl+Shift+Space");
+        const buttonEl = Object.assign(new EventTarget(), { focus: jest.fn() });
+        const button = {
+            buttonEl,
+            setButtonText: jest.fn().mockReturnThis(),
+            setTooltip: jest.fn().mockReturnThis(),
+            onClick: jest.fn().mockReturnThis(),
+        };
+        const clearButton = {
+            setButtonText: jest.fn().mockReturnThis(),
+            onClick: jest.fn().mockReturnThis(),
+        };
+        const addButton = jest.fn()
+            .mockImplementationOnce((configure: (component: ButtonComponent) => void) => {
+                configure(button as unknown as ButtonComponent);
+            })
+            .mockImplementationOnce((configure: (component: ButtonComponent) => void) => {
+                configure(clearButton as unknown as ButtonComponent);
+            });
+        row.render({ addButton } as unknown as Setting);
 
-        expect(globalShortcut.unregister).toHaveBeenCalledWith("Ctrl+Shift+Space");
-        expect(globalShortcut.register).toHaveBeenCalledWith(
-            "Ctrl+Shift+Space",
-            expect.any(Function)
-        );
+        const startRecording = button.onClick.mock.calls[0][0] as () => void;
+        startRecording();
+        expect(button.setButtonText).toHaveBeenLastCalledWith("Press shortcut…");
+        buttonEl.dispatchEvent(Object.assign(new Event("keydown"), { key: "Escape" }));
+        expect(update).not.toHaveBeenCalled();
+
+        startRecording();
+        buttonEl.dispatchEvent(Object.assign(new Event("keydown"), { key: "Shift", shiftKey: true }));
+        expect(update).not.toHaveBeenCalled();
+        buttonEl.dispatchEvent(Object.assign(new Event("keydown"), {
+            key: " ",
+            metaKey: true,
+            shiftKey: true,
+        }));
+        expect(update).toHaveBeenCalledWith("Command+Shift+Space");
     });
 });
 

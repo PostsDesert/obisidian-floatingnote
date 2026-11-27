@@ -467,6 +467,7 @@ export class Setting {
     setName = jest.fn().mockReturnThis();
     setHeading = jest.fn().mockReturnThis();
     setDesc = jest.fn().mockReturnThis();
+    addButton = jest.fn().mockReturnThis();
     addText = jest.fn().mockReturnThis();
     addTextArea = jest.fn().mockReturnThis();
     addToggle = jest.fn().mockReturnThis();
