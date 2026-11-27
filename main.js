@@ -39,59 +39,87 @@ var LEGACY_DEFAULT_SETTINGS = {
 var DEFAULT_SETTINGS = {
   noteFolder: "Quick Notes",
   noteTitleFormat: "[Quick] - YYYY-MM-DD HH[h]mm",
+  globalShortcut: "Ctrl+`",
   windowWidth: 480,
   windowHeight: 600,
   defaultNoteContent: "# Quick Notes\n\n**Date:** {{date}}\n\n---\n\n",
   alwaysOnTop: true,
-  opacity: 100
+  opacity: 100,
+  extraReusableNotePaths: [],
+  lastFocusedReusableNotePath: ""
 };
+var BUILD_ID = "2026-04-24T00:20Z-single-floating-tabs";
+var FOCUSABILITY_RESTORE_DELAY_MS = 750;
 var FloatingNotePlugin = class extends import_obsidian.Plugin {
+  constructor() {
+    super(...arguments);
+    this.floatingAnchorLeaf = null;
+    this.floatingWindow = null;
+    this.floatingTabs = /* @__PURE__ */ new Map();
+    this.registeredGlobalShortcut = null;
+    this.reusableToggleQueue = Promise.resolve();
+    this.floatingCloseGuardWindow = null;
+    this.floatingCloseGuardHandler = null;
+    this.windowsGuardedDuringClose = /* @__PURE__ */ new Set();
+  }
   async onload() {
+    this.debugLog("plugin:onload", { buildId: BUILD_ID });
     await this.loadSettings();
     this.addCommand({
       id: "open-new-note",
       name: "Open new note",
-      callback: () => this.openFloatingNote(true)
+      callback: () => void this.openFloatingNote(true)
     });
     this.addCommand({
       id: "open-todays-note",
-      name: "Open today's quick note (floating)",
-      callback: () => this.openFloatingNote(false)
+      name: "Toggle reusable quick note (floating)",
+      callback: () => void this.openFloatingNote(false)
     });
     this.addRibbonIcon("pin", "Open new floating quick note", () => {
       void this.openFloatingNote(true);
     });
+    this.registerEvent(
+      this.app.workspace.on("window-close", (_workspaceWindow, window2) => {
+        if (this.floatingWindow === window2) {
+          this.clearFloatingSession();
+        }
+      })
+    );
+    this.registerEvent(
+      this.app.workspace.on("active-leaf-change", (leaf) => {
+        void this.handleActiveLeafChange(leaf);
+      })
+    );
+    this.register(() => {
+      this.unregisterGlobalShortcut();
+      this.unregisterFloatingWindowCloseGuard();
+      this.clearFloatingSession();
+    });
+    this.registerGlobalShortcut();
     this.addSettingTab(new FloatingNoteSettingTab(this.app, this));
   }
-  async openFloatingNote(createNew) {
-    var _a;
-    const file = createNew ? await this.createNewQuickNote() : await this.getOrCreateTodaysQuickNote();
+  async openFloatingNote(createNew, source = "command") {
+    this.debugLog("openFloatingNote:start", { createNew, source });
+    if (!createNew && source === "global" && this.hasReusableFloatingSession()) {
+      await this.toggleReusableFloatingNote(source);
+      return;
+    }
+    if (source === "global") {
+      const workspaceReady = await this.ensureWorkspaceWindowForGlobalLaunch();
+      if (!workspaceReady) {
+        return;
+      }
+    }
+    if (!createNew) {
+      await this.toggleReusableFloatingNote(source);
+      return;
+    }
+    const file = await this.createNewQuickNote();
     if (!file) {
       new import_obsidian.Notice("Failed to create or find a quick note.");
       return;
     }
-    const leaf = this.app.workspace.openPopoutLeaf({
-      size: {
-        width: this.settings.windowWidth,
-        height: this.settings.windowHeight
-      }
-    });
-    await leaf.openFile(file, { active: true, state: { mode: "source" } });
-    const view = leaf.view;
-    if (view instanceof import_obsidian.MarkdownView) {
-      this.app.workspace.setActiveLeaf(leaf, { focus: true });
-      (_a = view.containerEl.ownerDocument.defaultView) == null ? void 0 : _a.focus();
-      const line = view.editor.lastLine();
-      view.editor.setCursor({ line, ch: view.editor.getLine(line).length });
-      view.editor.focus();
-    }
-    window.setTimeout(() => {
-      this.lightenPopoutHeaderBar(leaf);
-      this.applyWindowSettings();
-      if (leaf.view === view && view instanceof import_obsidian.MarkdownView && view.containerEl.ownerDocument.hasFocus()) {
-        view.editor.focus();
-      }
-    }, 200);
+    await this.openNewFloatingNote(file, source);
   }
   lightenPopoutHeaderBar(leaf) {
     var _a, _b;
@@ -104,52 +132,807 @@ var FloatingNotePlugin = class extends import_obsidian.Plugin {
       "--titlebar-background-focused": "var(--background-secondary-alt)"
     });
   }
-  applyWindowSettings() {
-    var _a, _b, _c;
-    try {
-      const electronModule = runtimeRequire == null ? void 0 : runtimeRequire("electron");
-      const win = (_b = (_a = electronModule == null ? void 0 : electronModule.remote) == null ? void 0 : _a.BrowserWindow.getFocusedWindow()) != null ? _b : null;
-      if (win) {
-        if (this.settings.alwaysOnTop) {
-          win.setAlwaysOnTop(true, "floating");
-          win.setVisibleOnAllWorkspaces(true);
-        }
-        if (this.settings.opacity < 100) {
-          win.setOpacity(this.settings.opacity / 100);
-        }
-        (_c = win.setTitle) == null ? void 0 : _c.call(win, "Quick notes");
-      } else {
-        this.tryElectronRemote();
+  applyWindowSettings(leaf) {
+    var _a, _b;
+    const win = this.getLeafElectronWindow(leaf);
+    if (!win) {
+      this.debugLog("applyWindowSettings:missing-window", {
+        leafId: this.getLeafId(leaf)
+      });
+      return false;
+    }
+    this.debugLog("applyWindowSettings:resolved-window", {
+      leafId: this.getLeafId(leaf),
+      alwaysOnTop: this.settings.alwaysOnTop,
+      opacity: this.settings.opacity,
+      bounds: (_a = win.getBounds) == null ? void 0 : _a.call(win)
+    });
+    this.registerFloatingWindowCloseGuard(win);
+    if (this.settings.alwaysOnTop) {
+      win.setAlwaysOnTop(true, "floating");
+      win.setVisibleOnAllWorkspaces(true, { skipTransformProcessType: true });
+    }
+    if (this.settings.opacity < 100) {
+      win.setOpacity(this.settings.opacity / 100);
+    }
+    (_b = win.setTitle) == null ? void 0 : _b.call(win, "Quick notes");
+    return true;
+  }
+  async toggleReusableFloatingNote(source) {
+    const toggleOperation = this.reusableToggleQueue.then(
+      () => this.runReusableToggle(source)
+    );
+    this.reusableToggleQueue = toggleOperation.catch(() => void 0);
+    await toggleOperation;
+  }
+  async runReusableToggle(source) {
+    const existingTabs = this.getTrackedFloatingTabs();
+    if (existingTabs.some((tab) => tab.reusable)) {
+      this.debugLog("toggleReusableFloatingNote:close-existing", {
+        source,
+        paths: existingTabs.map((tab) => ({
+          path: tab.path,
+          reusable: tab.reusable
+        }))
+      });
+      await this.closeFloatingSession();
+      return;
+    }
+    const reusableFiles = await this.getOrCreateReusableNoteSet();
+    if (!reusableFiles) {
+      new import_obsidian.Notice("Failed to create or find a quick note.");
+      return;
+    }
+    const reusablePaths = Array.from(reusableFiles.keys());
+    const primaryPath = reusablePaths[0];
+    if (!primaryPath) {
+      new import_obsidian.Notice("Failed to create or find a quick note.");
+      return;
+    }
+    const focusedPath = this.getReusableFocusTargetPath(reusablePaths, primaryPath);
+    const reusableEntries = reusablePaths.map((path) => {
+      const file = reusableFiles.get(path);
+      return file ? { path, file, reusable: true } : null;
+    }).filter((entry) => entry !== null);
+    this.debugLog("toggleReusableFloatingNote:open-new", {
+      source,
+      paths: reusablePaths,
+      focusedPath
+    });
+    await this.openFloatingTabs(reusableEntries, focusedPath, source);
+  }
+  async openNewFloatingNote(file, source) {
+    await this.openFloatingTabs(
+      [{ path: file.path, file, reusable: false }],
+      file.path,
+      source
+    );
+  }
+  async openFloatingTabs(entries, focusedPath, source) {
+    const existingTabs = this.getTrackedFloatingTabs();
+    let anchorLeaf = this.getFloatingAnchorLeaf();
+    const placement = anchorLeaf ? null : this.getPopoutPlacement(source);
+    const createdSession = !anchorLeaf;
+    this.debugLog("openFloatingTabs:start", {
+      source,
+      focusedPath,
+      createdSession,
+      entries: entries.map((entry) => ({
+        path: entry.path,
+        reusable: entry.reusable
+      }))
+    });
+    const creationEntries = this.getFloatingTabCreationOrder(entries, createdSession);
+    for (const entry of creationEntries) {
+      const existingTab = this.floatingTabs.get(entry.path);
+      if (existingTab) {
+        existingTab.reusable = existingTab.reusable || entry.reusable;
+        continue;
       }
-    } catch (e) {
-      this.tryElectronRemote();
+      const leaf = anchorLeaf ? this.createTabInFloatingWindow(anchorLeaf) : this.createFloatingAnchorLeaf(placement);
+      if (!leaf) {
+        return;
+      }
+      await leaf.openFile(entry.file, { active: false, state: { mode: "source" } });
+      this.trackFloatingTab(entry.path, leaf, entry.reusable);
+      if (!anchorLeaf) {
+        anchorLeaf = leaf;
+      }
+    }
+    const focusedTab = this.floatingTabs.get(focusedPath);
+    if (focusedTab) {
+      this.focusFloatingLeaf(focusedTab.leaf);
+    }
+    if (createdSession && anchorLeaf) {
+      this.scheduleFloatingWindowSetup(anchorLeaf, placement);
+    }
+    this.debugLog("openFloatingTabs:done", {
+      source,
+      openTabs: this.getTrackedFloatingTabs().map((tab) => ({
+        path: tab.path,
+        reusable: tab.reusable
+      })),
+      existingTabsBefore: existingTabs.map((tab) => tab.path)
+    });
+  }
+  getFloatingTabCreationOrder(entries, createdSession) {
+    if (createdSession) {
+      const [anchorEntry, ...tabEntries] = entries;
+      return anchorEntry ? [anchorEntry, ...tabEntries.reverse()] : [];
+    }
+    return [...entries].reverse();
+  }
+  prepareEditorForBottomEntry(leaf) {
+    var _a;
+    const editor = (_a = leaf.view) == null ? void 0 : _a.editor;
+    if (!editor) {
+      return;
+    }
+    const content = editor.getValue();
+    if (content.length > 0 && !content.endsWith("\n")) {
+      editor.replaceRange("\n", this.getEditorEndPosition(editor));
+    }
+    const endOfDocument = this.getEditorEndPosition(editor);
+    editor.setCursor(endOfDocument);
+    editor.scrollIntoView({ from: endOfDocument, to: endOfDocument }, true);
+    editor.focus();
+  }
+  getEditorEndPosition(editor) {
+    const lastLine = editor.lastLine();
+    return {
+      line: lastLine,
+      ch: editor.getLine(lastLine).length
+    };
+  }
+  getPopoutWindowData(placement) {
+    const size = {
+      width: this.settings.windowWidth,
+      height: this.settings.windowHeight
+    };
+    if (!placement) {
+      return { size };
+    }
+    return {
+      x: placement.x,
+      y: placement.y,
+      size
+    };
+  }
+  positionPopoutWindow(popoutWindow, placement) {
+    var _a;
+    this.debugLog("positionPopoutWindow", {
+      placement,
+      domWindow: this.describeDomWindow(popoutWindow)
+    });
+    (_a = popoutWindow == null ? void 0 : popoutWindow.moveTo) == null ? void 0 : _a.call(popoutWindow, placement.x, placement.y);
+  }
+  getPopoutPlacement(source) {
+    return this.getPopoutPlacementForDisplay(this.getTargetDisplay(source));
+  }
+  getPopoutPlacementForDisplay(display) {
+    var _a;
+    if (!display) {
+      return null;
+    }
+    const workArea = (_a = display.workArea) != null ? _a : display.bounds;
+    const width = this.settings.windowWidth;
+    const height = this.settings.windowHeight;
+    const centeredX = Math.round(workArea.x + (workArea.width - width) / 2);
+    const centeredY = Math.round(workArea.y + (workArea.height - height) / 2);
+    const maxX = workArea.x + Math.max(workArea.width - width, 0);
+    const maxY = workArea.y + Math.max(workArea.height - height, 0);
+    return {
+      x: Math.min(Math.max(centeredX, workArea.x), maxX),
+      y: Math.min(Math.max(centeredY, workArea.y), maxY)
+    };
+  }
+  getTargetDisplay(source) {
+    var _a, _b;
+    const screen = this.getElectronScreen();
+    if (!screen) {
+      this.debugLog("getTargetDisplay:no-screen", { source });
+      return null;
+    }
+    if (source === "command") {
+      const focusedWindow = this.getFocusedElectronWindow();
+      const bounds = (_a = focusedWindow == null ? void 0 : focusedWindow.getBounds) == null ? void 0 : _a.call(focusedWindow);
+      if (bounds) {
+        const display2 = screen.getDisplayMatching(bounds);
+        this.debugLog("getTargetDisplay:focused-window", {
+          source,
+          bounds,
+          displayBounds: display2.bounds,
+          displayWorkArea: display2.workArea
+        });
+        return display2;
+      }
+    }
+    const cursorPosition = screen.getCursorScreenPoint();
+    const display = (_b = screen.getDisplayNearestPoint(cursorPosition)) != null ? _b : screen.getPrimaryDisplay();
+    this.debugLog("getTargetDisplay:cursor", {
+      source,
+      cursorPosition,
+      displayBounds: display.bounds,
+      displayWorkArea: display.workArea
+    });
+    return display;
+  }
+  getTrackedFloatingTabs() {
+    var _a, _b, _c;
+    if ((_a = this.floatingWindow) == null ? void 0 : _a.closed) {
+      this.clearFloatingSession();
+      return [];
+    }
+    for (const [path, entry] of this.floatingTabs.entries()) {
+      if (this.isLeafClosed(entry.leaf)) {
+        this.floatingTabs.delete(path);
+      }
+    }
+    if (this.floatingTabs.size === 0) {
+      this.floatingAnchorLeaf = null;
+      this.floatingWindow = null;
+      return [];
+    }
+    if (!this.floatingAnchorLeaf || this.isLeafClosed(this.floatingAnchorLeaf)) {
+      this.floatingAnchorLeaf = (_c = (_b = Array.from(this.floatingTabs.values())[0]) == null ? void 0 : _b.leaf) != null ? _c : null;
+    }
+    if (!this.floatingWindow && this.floatingAnchorLeaf) {
+      this.floatingWindow = this.getLeafWindow(this.floatingAnchorLeaf);
+    }
+    return Array.from(this.floatingTabs.values());
+  }
+  getFloatingAnchorLeaf() {
+    this.getTrackedFloatingTabs();
+    return this.floatingAnchorLeaf;
+  }
+  trackFloatingTab(path, leaf, reusable) {
+    this.floatingTabs.set(path, { path, leaf, reusable });
+    if (!this.floatingAnchorLeaf) {
+      this.floatingAnchorLeaf = leaf;
+    }
+    if (!this.floatingWindow) {
+      this.floatingWindow = this.getLeafWindow(leaf);
+    }
+    this.debugLog("trackFloatingTab", {
+      path,
+      reusable,
+      leafId: this.getLeafId(leaf),
+      anchorLeafId: this.getLeafId(this.floatingAnchorLeaf),
+      domWindow: this.describeDomWindow(this.floatingWindow)
+    });
+  }
+  clearFloatingSession() {
+    this.debugLog("clearFloatingSession", {
+      anchorLeafId: this.getLeafId(this.floatingAnchorLeaf),
+      tabPaths: Array.from(this.floatingTabs.keys()),
+      domWindow: this.describeDomWindow(this.floatingWindow)
+    });
+    this.unregisterFloatingWindowCloseGuard();
+    this.floatingTabs.clear();
+    this.floatingAnchorLeaf = null;
+    this.floatingWindow = null;
+  }
+  async closeFloatingSession() {
+    var _a;
+    const anchorLeaf = this.getFloatingAnchorLeaf();
+    if (!anchorLeaf) {
+      this.clearFloatingSession();
+      return;
+    }
+    const electronWindow = this.getLeafElectronWindow(anchorLeaf);
+    this.guardOtherWindowsDuringClose(electronWindow);
+    const workspaceContainer = this.getLeafWorkspaceContainer(anchorLeaf);
+    if ((workspaceContainer == null ? void 0 : workspaceContainer.close) && workspaceContainer.win) {
+      this.debugLog("closeFloatingSession:close-window", {
+        strategy: "workspace-container",
+        anchorLeafId: this.getLeafId(anchorLeaf),
+        domWindow: this.describeDomWindow(workspaceContainer.win)
+      });
+      workspaceContainer.close();
+      return;
+    }
+    if (electronWindow == null ? void 0 : electronWindow.close) {
+      this.debugLog("closeFloatingSession:close-window", {
+        strategy: "electron",
+        anchorLeafId: this.getLeafId(anchorLeaf),
+        bounds: (_a = electronWindow.getBounds) == null ? void 0 : _a.call(electronWindow)
+      });
+      electronWindow.close();
+      return;
+    }
+    const domWindow = this.getLeafWindow(anchorLeaf);
+    if (domWindow == null ? void 0 : domWindow.close) {
+      this.debugLog("closeFloatingSession:close-window", {
+        strategy: "dom",
+        anchorLeafId: this.getLeafId(anchorLeaf),
+        domWindow: this.describeDomWindow(domWindow)
+      });
+      domWindow.close();
+      return;
+    }
+    this.debugLog("closeFloatingSession:close-window", {
+      strategy: "detach-fallback",
+      anchorLeafId: this.getLeafId(anchorLeaf)
+    });
+    for (const tab of this.getTrackedFloatingTabs()) {
+      tab.leaf.detach();
+    }
+    this.clearFloatingSession();
+  }
+  guardOtherWindowsDuringClose(floatingWindow) {
+    var _a, _b, _c;
+    for (const window2 of this.getAllElectronWindows()) {
+      if (window2 === floatingWindow || this.windowsGuardedDuringClose.has(window2) || ((_a = window2.isDestroyed) == null ? void 0 : _a.call(window2))) {
+        continue;
+      }
+      let restoreFocusability = false;
+      let wasMinimized = false;
+      let watchingRestore = false;
+      const keepMinimized = () => {
+        var _a2, _b2, _c2;
+        if (wasMinimized && !((_a2 = window2.isDestroyed) == null ? void 0 : _a2.call(window2)) && ((_b2 = window2.isMinimized) == null ? void 0 : _b2.call(window2)) === false) {
+          wasMinimized = false;
+          (_c2 = window2.minimize) == null ? void 0 : _c2.call(window2);
+        }
+      };
+      const onRestore = () => setTimeout(keepMinimized, 0);
+      this.windowsGuardedDuringClose.add(window2);
+      try {
+        wasMinimized = ((_b = window2.isMinimized) == null ? void 0 : _b.call(window2)) === true;
+        if (window2.setFocusable && ((_c = window2.isFocusable) == null ? void 0 : _c.call(window2)) !== false) {
+          window2.setFocusable(false);
+          restoreFocusability = true;
+        }
+        if (wasMinimized && window2.on) {
+          window2.on("restore", onRestore);
+          watchingRestore = true;
+        }
+      } catch (err) {
+        this.debugLog("guardOtherWindowsDuringClose:failed", {
+          error: err instanceof Error ? err.message : String(err)
+        });
+      }
+      setTimeout(() => {
+        var _a2, _b2, _c2;
+        this.windowsGuardedDuringClose.delete(window2);
+        if ((_a2 = window2.isDestroyed) == null ? void 0 : _a2.call(window2)) {
+          return;
+        }
+        try {
+          if (watchingRestore) {
+            const removeListener = (_b2 = window2.off) != null ? _b2 : window2.removeListener;
+            removeListener == null ? void 0 : removeListener.call(window2, "restore", onRestore);
+          }
+          keepMinimized();
+          if (restoreFocusability) {
+            (_c2 = window2.setFocusable) == null ? void 0 : _c2.call(window2, true);
+          }
+        } catch (err) {
+          this.debugLog("guardOtherWindowsDuringClose:cleanup-failed", {
+            error: err instanceof Error ? err.message : String(err)
+          });
+        } finally {
+          wasMinimized = false;
+        }
+      }, FOCUSABILITY_RESTORE_DELAY_MS);
     }
   }
-  tryElectronRemote() {
-    var _a, _b, _c, _d;
+  registerFloatingWindowCloseGuard(window2) {
+    if (this.floatingCloseGuardWindow === window2) {
+      return;
+    }
+    this.unregisterFloatingWindowCloseGuard();
+    if (!window2.on) {
+      this.debugLog("registerFloatingWindowCloseGuard:missing-on");
+      return;
+    }
+    const closeGuard = () => {
+      this.debugLog("floatingWindow:close-guard");
+      this.guardOtherWindowsDuringClose(window2);
+    };
     try {
-      if (!runtimeRequire) {
-        throw new Error("Runtime require is not available.");
-      }
-      const electronRemote = runtimeRequire("@electron/remote");
-      const browserWindow = (_c = (_b = electronRemote.BrowserWindow) != null ? _b : (_a = electronRemote.default) == null ? void 0 : _a.BrowserWindow) != null ? _c : null;
-      const win = (_d = browserWindow == null ? void 0 : browserWindow.getFocusedWindow()) != null ? _d : null;
-      if (win) {
-        if (this.settings.alwaysOnTop) {
-          win.setAlwaysOnTop(true, "floating");
-          win.setVisibleOnAllWorkspaces(true);
-        }
-        if (this.settings.opacity < 100) {
-          win.setOpacity(this.settings.opacity / 100);
-        }
+      window2.on("close", closeGuard);
+      this.floatingCloseGuardWindow = window2;
+      this.floatingCloseGuardHandler = closeGuard;
+    } catch (err) {
+      this.debugLog("registerFloatingWindowCloseGuard:failed", {
+        error: err instanceof Error ? err.message : String(err)
+      });
+    }
+  }
+  unregisterFloatingWindowCloseGuard() {
+    var _a;
+    const window2 = this.floatingCloseGuardWindow;
+    const closeGuard = this.floatingCloseGuardHandler;
+    this.floatingCloseGuardWindow = null;
+    this.floatingCloseGuardHandler = null;
+    if (!window2 || !closeGuard) {
+      return;
+    }
+    try {
+      if (window2.off) {
+        window2.off("close", closeGuard);
+      } else {
+        (_a = window2.removeListener) == null ? void 0 : _a.call(window2, "close", closeGuard);
       }
     } catch (err) {
+      this.debugLog("unregisterFloatingWindowCloseGuard:failed", {
+        error: err instanceof Error ? err.message : String(err)
+      });
+    }
+  }
+  createFloatingAnchorLeaf(placement) {
+    const leaf = this.app.workspace.openPopoutLeaf(this.getPopoutWindowData(placement));
+    this.floatingAnchorLeaf = leaf;
+    this.floatingWindow = this.getLeafWindow(leaf);
+    this.debugLog("createFloatingAnchorLeaf", {
+      leafId: this.getLeafId(leaf),
+      placement,
+      domWindow: this.describeDomWindow(this.floatingWindow)
+    });
+    return leaf;
+  }
+  createTabInFloatingWindow(anchorLeaf) {
+    this.app.workspace.setActiveLeaf(anchorLeaf, { focus: false });
+    const leaf = this.app.workspace.getLeaf("tab");
+    if (!this.isLeafInFloatingWindow(leaf, anchorLeaf)) {
+      this.debugLog("createTabInFloatingWindow:wrong-window", {
+        anchorLeafId: this.getLeafId(anchorLeaf),
+        leafId: this.getLeafId(leaf),
+        anchorWindow: this.describeDomWindow(this.getLeafWindow(anchorLeaf)),
+        leafWindow: this.describeDomWindow(this.getLeafWindow(leaf))
+      });
+      leaf.detach();
+      new import_obsidian.Notice("Could not open a tab in the floating window.", 5e3);
+      return null;
+    }
+    return leaf;
+  }
+  isLeafInFloatingWindow(leaf, anchorLeaf) {
+    return this.getLeafWindow(leaf) === this.getLeafWindow(anchorLeaf);
+  }
+  activateFloatingTab(leaf, focus = true) {
+    this.app.workspace.setActiveLeaf(leaf, { focus });
+    if (focus) {
+      this.prepareEditorForBottomEntry(leaf);
+    }
+  }
+  focusFloatingLeaf(leaf) {
+    var _a, _b;
+    this.activateFloatingTab(leaf, true);
+    (_b = (_a = this.getLeafElectronWindow(leaf)) == null ? void 0 : _a.focus) == null ? void 0 : _b.call(_a);
+  }
+  scheduleFloatingWindowSetup(leaf, placement) {
+    window.setTimeout(() => {
+      var _a;
+      if (!this.shouldRunPostOpenWindowWork(leaf)) {
+        this.debugLog("scheduleFloatingWindowSetup:skip", {
+          leafId: this.getLeafId(leaf)
+        });
+        return;
+      }
+      const popoutWindow = this.getLeafWindow(leaf);
+      this.debugLog("scheduleFloatingWindowSetup:run", {
+        leafId: this.getLeafId(leaf),
+        placement,
+        domWindow: this.describeDomWindow(popoutWindow)
+      });
+      if (placement) {
+        this.positionPopoutWindow(popoutWindow, placement);
+      }
+      this.lightenPopoutHeaderBar(leaf);
+      this.applyWindowSettingsWithRetry(leaf);
+      const activeLeaf = this.app.workspace.activeLeaf;
+      if (activeLeaf && this.floatingTabsHasLeaf(activeLeaf)) {
+        const view = activeLeaf.view;
+        if (view.containerEl.ownerDocument.hasFocus()) {
+          (_a = view.editor) == null ? void 0 : _a.focus();
+        }
+      }
+    }, 200);
+  }
+  shouldRunPostOpenWindowWork(leaf) {
+    return !this.isLeafClosed(leaf) && this.floatingTabsHasLeaf(leaf);
+  }
+  floatingTabsHasLeaf(leaf) {
+    return this.getTrackedFloatingTabs().some((entry) => entry.leaf === leaf);
+  }
+  isLeafClosed(leaf) {
+    return leaf.detached === true;
+  }
+  hasReusableFloatingSession() {
+    return this.getTrackedFloatingTabs().some((entry) => entry.reusable);
+  }
+  async handleActiveLeafChange(leaf) {
+    if (!leaf) {
+      return;
+    }
+    const activeTab = this.getTrackedFloatingTabs().find((entry) => entry.leaf === leaf);
+    if (!(activeTab == null ? void 0 : activeTab.reusable)) {
+      return;
+    }
+    await this.rememberLastFocusedReusableNote(activeTab.path);
+  }
+  getElectronModule() {
+    var _a;
+    return (_a = runtimeRequire == null ? void 0 : runtimeRequire("electron")) != null ? _a : null;
+  }
+  getLeafWorkspaceContainer(leaf) {
+    var _a, _b;
+    return (_b = (_a = leaf.getContainer) == null ? void 0 : _a.call(leaf)) != null ? _b : null;
+  }
+  getLeafWindow(leaf) {
+    var _a, _b, _c, _d, _e, _f;
+    const containerWindow = (_b = (_a = this.getLeafWorkspaceContainer(leaf)) == null ? void 0 : _a.win) != null ? _b : null;
+    if (containerWindow) {
+      this.debugLog("getLeafWindow:container", {
+        leafId: this.getLeafId(leaf),
+        domWindow: this.describeDomWindow(containerWindow)
+      });
+      return containerWindow;
+    }
+    const documentWindow = (_f = (_e = (_d = (_c = leaf.view) == null ? void 0 : _c.containerEl) == null ? void 0 : _d.ownerDocument) == null ? void 0 : _e.defaultView) != null ? _f : null;
+    this.debugLog("getLeafWindow:document", {
+      leafId: this.getLeafId(leaf),
+      domWindow: this.describeDomWindow(documentWindow)
+    });
+    return documentWindow;
+  }
+  getLeafElectronWindow(leaf) {
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k;
+    const popoutWindow = this.getLeafWindow(leaf);
+    if (!popoutWindow) {
+      this.debugLog("getLeafElectronWindow:no-dom-window", {
+        leafId: this.getLeafId(leaf)
+      });
+      return null;
+    }
+    const popoutRequire = (_a = popoutWindow.require) != null ? _a : runtimeRequire;
+    if (!popoutRequire) {
+      return null;
+    }
+    try {
+      const electronModule = popoutRequire("electron");
+      const currentWindow = (_d = (_c = (_b = electronModule == null ? void 0 : electronModule.remote) == null ? void 0 : _b.getCurrentWindow) == null ? void 0 : _c.call(_b)) != null ? _d : null;
+      if (currentWindow) {
+        this.debugLog("getLeafElectronWindow:electron", {
+          leafId: this.getLeafId(leaf),
+          bounds: (_e = currentWindow.getBounds) == null ? void 0 : _e.call(currentWindow)
+        });
+        return currentWindow;
+      }
+      this.debugLog("getLeafElectronWindow:electron-null", {
+        leafId: this.getLeafId(leaf)
+      });
+    } catch (e) {
+      this.debugLog("getLeafElectronWindow:electron-error", {
+        leafId: this.getLeafId(leaf)
+      });
+    }
+    try {
+      const electronRemote = popoutRequire("@electron/remote");
+      const currentWindow = (_j = (_i = (_f = electronRemote.getCurrentWindow) == null ? void 0 : _f.call(electronRemote)) != null ? _i : (_h = (_g = electronRemote.default) == null ? void 0 : _g.getCurrentWindow) == null ? void 0 : _h.call(_g)) != null ? _j : null;
+      this.debugLog("getLeafElectronWindow:remote", {
+        leafId: this.getLeafId(leaf),
+        resolved: Boolean(currentWindow),
+        bounds: (_k = currentWindow == null ? void 0 : currentWindow.getBounds) == null ? void 0 : _k.call(currentWindow)
+      });
+      return currentWindow;
+    } catch (e) {
+      this.debugLog("getLeafElectronWindow:remote-error", {
+        leafId: this.getLeafId(leaf)
+      });
+      return null;
+    }
+  }
+  applyWindowSettingsWithRetry(leaf, retriesRemaining = 10) {
+    if (this.applyWindowSettings(leaf)) {
+      this.debugLog("applyWindowSettingsWithRetry:applied", {
+        leafId: this.getLeafId(leaf),
+        retriesRemaining
+      });
+      return;
+    }
+    const popoutWindow = this.getLeafWindow(leaf);
+    if (!popoutWindow || popoutWindow.closed || retriesRemaining <= 1) {
+      this.debugLog("applyWindowSettingsWithRetry:stop", {
+        leafId: this.getLeafId(leaf),
+        retriesRemaining,
+        domWindow: this.describeDomWindow(popoutWindow)
+      });
+      return;
+    }
+    this.debugLog("applyWindowSettingsWithRetry:retry", {
+      leafId: this.getLeafId(leaf),
+      retriesRemaining
+    });
+    setTimeout(() => this.applyWindowSettingsWithRetry(leaf, retriesRemaining - 1), 50);
+  }
+  getRemoteElectronModule() {
+    try {
+      if (!runtimeRequire) {
+        return null;
+      }
+      return runtimeRequire("@electron/remote");
+    } catch (e) {
+      return null;
+    }
+  }
+  getElectronScreen() {
+    var _a, _b, _c;
+    const electronModule = this.getElectronModule();
+    if (electronModule == null ? void 0 : electronModule.screen) {
+      return electronModule.screen;
+    }
+    const remoteModule = this.getRemoteElectronModule();
+    return (_c = (_b = remoteModule == null ? void 0 : remoteModule.screen) != null ? _b : (_a = remoteModule == null ? void 0 : remoteModule.default) == null ? void 0 : _a.screen) != null ? _c : null;
+  }
+  getGlobalShortcutModule() {
+    var _a, _b, _c;
+    const electronModule = this.getElectronModule();
+    if (electronModule == null ? void 0 : electronModule.globalShortcut) {
+      return electronModule.globalShortcut;
+    }
+    const remoteModule = this.getRemoteElectronModule();
+    return (_c = (_b = remoteModule == null ? void 0 : remoteModule.globalShortcut) != null ? _b : (_a = remoteModule == null ? void 0 : remoteModule.default) == null ? void 0 : _a.globalShortcut) != null ? _c : null;
+  }
+  getElectronAppModule() {
+    var _a, _b, _c;
+    const electronModule = this.getElectronModule();
+    if (electronModule == null ? void 0 : electronModule.app) {
+      return electronModule.app;
+    }
+    const remoteModule = this.getRemoteElectronModule();
+    return (_c = (_b = remoteModule == null ? void 0 : remoteModule.app) != null ? _b : (_a = remoteModule == null ? void 0 : remoteModule.default) == null ? void 0 : _a.app) != null ? _c : null;
+  }
+  getBrowserWindowModule() {
+    var _a, _b, _c, _d;
+    const electronModule = this.getElectronModule();
+    const browserWindow = (_a = electronModule == null ? void 0 : electronModule.remote) == null ? void 0 : _a.BrowserWindow;
+    if (browserWindow) {
+      return browserWindow;
+    }
+    const remoteModule = this.getRemoteElectronModule();
+    return (_d = (_c = remoteModule == null ? void 0 : remoteModule.BrowserWindow) != null ? _c : (_b = remoteModule == null ? void 0 : remoteModule.default) == null ? void 0 : _b.BrowserWindow) != null ? _d : null;
+  }
+  getAllElectronWindows() {
+    var _a, _b, _c;
+    return (_c = (_b = (_a = this.getBrowserWindowModule()) == null ? void 0 : _a.getAllWindows) == null ? void 0 : _b.call(_a)) != null ? _c : [];
+  }
+  getFocusedElectronWindow() {
+    var _a, _b;
+    try {
+      return (_b = (_a = this.getBrowserWindowModule()) == null ? void 0 : _a.getFocusedWindow()) != null ? _b : null;
+    } catch (e) {
+      return this.getFocusedElectronWindowFromRemoteFallback();
+    }
+  }
+  getFocusedElectronWindowFromRemoteFallback() {
+    var _a, _b, _c, _d;
+    const electronRemote = this.getRemoteElectronModule();
+    const browserWindow = (_c = (_b = electronRemote == null ? void 0 : electronRemote.BrowserWindow) != null ? _b : (_a = electronRemote == null ? void 0 : electronRemote.default) == null ? void 0 : _a.BrowserWindow) != null ? _c : null;
+    return (_d = browserWindow == null ? void 0 : browserWindow.getFocusedWindow()) != null ? _d : null;
+  }
+  async ensureWorkspaceWindowForGlobalLaunch() {
+    var _a, _b, _c, _d, _e, _f;
+    const existingWindows = this.getAllElectronWindows();
+    if (existingWindows.length > 0) {
+      return true;
+    }
+    this.debugLog("ensureWorkspaceWindowForGlobalLaunch:no-windows");
+    const electronApp = this.getElectronAppModule();
+    if (!electronApp) {
+      new import_obsidian.Notice("Could not reactivate Obsidian with no windows open.", 5e3);
+      return false;
+    }
+    try {
+      await ((_b = (_a = electronApp.dock) == null ? void 0 : _a.show) == null ? void 0 : _b.call(_a));
+    } catch (e) {
+      this.debugLog("ensureWorkspaceWindowForGlobalLaunch:dock-show-failed");
+    }
+    try {
+      (_c = electronApp.show) == null ? void 0 : _c.call(electronApp);
+      electronApp.focus({ steal: true });
+    } catch (e) {
+      this.debugLog("ensureWorkspaceWindowForGlobalLaunch:app-focus-failed");
+    }
+    const restoredWindow = await this.waitForElectronWindow();
+    if (!restoredWindow) {
+      new import_obsidian.Notice("Could not reopen an Obsidian window for the quick note shortcut.", 5e3);
+      return false;
+    }
+    (_d = restoredWindow.show) == null ? void 0 : _d.call(restoredWindow);
+    (_e = restoredWindow.focus) == null ? void 0 : _e.call(restoredWindow);
+    await this.sleep(150);
+    this.debugLog("ensureWorkspaceWindowForGlobalLaunch:restored-window", {
+      bounds: (_f = restoredWindow.getBounds) == null ? void 0 : _f.call(restoredWindow)
+    });
+    return true;
+  }
+  async waitForElectronWindow(timeoutMs = 2e3, intervalMs = 50) {
+    var _a;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const window2 = (_a = this.getAllElectronWindows()[0]) != null ? _a : null;
+      if (window2) {
+        return window2;
+      }
+      await this.sleep(intervalMs);
+    }
+    return null;
+  }
+  sleep(ms) {
+    return new Promise((resolve) => {
+      setTimeout(resolve, ms);
+    });
+  }
+  registerGlobalShortcut() {
+    const globalShortcut = this.getGlobalShortcutModule();
+    const accelerator = this.settings.globalShortcut.trim();
+    if (!globalShortcut) {
+      this.registeredGlobalShortcut = null;
+      return;
+    }
+    const previousAccelerator = this.registeredGlobalShortcut;
+    if (previousAccelerator) {
+      globalShortcut.unregister(previousAccelerator);
+    }
+    this.registeredGlobalShortcut = null;
+    if (!accelerator) {
+      return;
+    }
+    globalShortcut.unregister(accelerator);
+    const wasRegistered = globalShortcut.register(accelerator, () => {
+      this.debugLog("globalShortcut:triggered", { accelerator });
+      void this.openFloatingNote(false, "global");
+    });
+    if (!wasRegistered) {
       new import_obsidian.Notice(
-        "Could not set always on top. Your Obsidian version may not support this.",
+        `Could not register global shortcut "${accelerator}". It may already be in use.`,
         5e3
       );
-      console.error("FloatingNote: Electron remote error", err);
+      return;
     }
+    this.registeredGlobalShortcut = accelerator;
+  }
+  getLeafId(leaf) {
+    var _a;
+    return (_a = leaf == null ? void 0 : leaf.id) != null ? _a : null;
+  }
+  describeDomWindow(popoutWindow) {
+    var _a, _b;
+    if (!popoutWindow) {
+      return null;
+    }
+    return {
+      closed: popoutWindow.closed,
+      screenX: popoutWindow.screenX,
+      screenY: popoutWindow.screenY,
+      outerWidth: popoutWindow.outerWidth,
+      outerHeight: popoutWindow.outerHeight,
+      hasRequire: typeof popoutWindow.require === "function",
+      isSelfWindow: popoutWindow.window === popoutWindow,
+      href: (_b = (_a = popoutWindow.location) == null ? void 0 : _a.href) != null ? _b : null
+    };
+  }
+  debugLog(message, details) {
+    console.log("[FloatingNote]", message, {
+      at: new Date().toISOString(),
+      buildId: BUILD_ID,
+      ...details != null ? details : {}
+    });
+  }
+  unregisterGlobalShortcut() {
+    const globalShortcut = this.getGlobalShortcutModule();
+    if (globalShortcut && this.registeredGlobalShortcut) {
+      globalShortcut.unregister(this.registeredGlobalShortcut);
+    }
+    this.registeredGlobalShortcut = null;
+  }
+  async updateGlobalShortcut(value) {
+    this.settings.globalShortcut = value.trim();
+    await this.saveSettings();
+    this.registerGlobalShortcut();
   }
   async createNewQuickNote() {
     const folder = this.settings.noteFolder;
@@ -171,20 +954,124 @@ var FloatingNotePlugin = class extends import_obsidian.Plugin {
     new import_obsidian.Notice("Could not create a unique note file after several attempts.");
     return null;
   }
-  async getOrCreateTodaysQuickNote() {
-    const folder = this.settings.noteFolder;
-    const title = currentMoment().format("YYYY-MM-DD") + " Quick Notes";
-    const path = folder ? `${folder}/${title}.md` : `${title}.md`;
+  async getOrCreateReusableQuickNote() {
+    const path = await this.getReusableQuickNotePath();
+    return await this.getOrCreateReusableNoteByPath(path);
+  }
+  async getOrCreateReusableNoteSet() {
+    const primaryPath = await this.getReusableQuickNotePath();
+    const reusablePaths = [primaryPath, ...this.normalizeExtraReusableNotePaths(this.settings.extraReusableNotePaths)].filter(
+      (path, index, paths) => paths.indexOf(path) === index
+    );
+    const reusableFiles = /* @__PURE__ */ new Map();
+    for (const path of reusablePaths) {
+      const file = await this.getOrCreateReusableNoteByPath(path);
+      if (!file) {
+        return null;
+      }
+      reusableFiles.set(path, file);
+    }
+    return reusableFiles;
+  }
+  async getOrCreateReusableNoteByPath(path) {
     const existing = this.app.vault.getAbstractFileByPath(path);
     if (existing instanceof import_obsidian.TFile) {
       return existing;
     }
-    const content = this.settings.defaultNoteContent.replace(
+    await this.ensureFolderExists(this.getFolderFromPath(path));
+    return await this.app.vault.create(path, this.getReusableNoteContent());
+  }
+  async getReusableQuickNotePath() {
+    const dailyNotesSettings = await this.getDailyNotesSettings();
+    if (dailyNotesSettings) {
+      const title2 = currentMoment().format(dailyNotesSettings.format);
+      return dailyNotesSettings.folder ? `${dailyNotesSettings.folder}/${title2}.md` : `${title2}.md`;
+    }
+    const folder = this.settings.noteFolder;
+    const title = currentMoment().format("YYYY-MM-DD") + " Quick Notes";
+    return folder ? `${folder}/${title}.md` : `${title}.md`;
+  }
+  getRuntimeDailyNotesSettings() {
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l;
+    const internalPlugins = this.app.internalPlugins;
+    const plugin = (_d = (_c = (_a = internalPlugins == null ? void 0 : internalPlugins.getPluginById) == null ? void 0 : _a.call(internalPlugins, "daily-notes")) != null ? _c : (_b = internalPlugins == null ? void 0 : internalPlugins.plugins) == null ? void 0 : _b["daily-notes"]) != null ? _d : null;
+    if (!(plugin == null ? void 0 : plugin.enabled)) {
+      return null;
+    }
+    const folder = (_h = (_g = (_f = (_e = plugin.instance) == null ? void 0 : _e.options) == null ? void 0 : _f.folder) == null ? void 0 : _g.trim()) != null ? _h : "";
+    const format = (_l = (_k = (_j = (_i = plugin.instance) == null ? void 0 : _i.options) == null ? void 0 : _j.format) == null ? void 0 : _k.trim()) != null ? _l : "";
+    if (!format) {
+      return null;
+    }
+    return { folder, format };
+  }
+  async readDailyNotesSettingsFile() {
+    var _a;
+    const vault = this.app.vault;
+    const adapter = vault.adapter;
+    const configDir = (_a = vault.configDir) == null ? void 0 : _a.trim();
+    if (!(adapter == null ? void 0 : adapter.read) || !configDir) {
+      return null;
+    }
+    try {
+      const rawSettings = await adapter.read(`${configDir}/daily-notes.json`);
+      const parsedSettings = JSON.parse(rawSettings);
+      const folder = typeof parsedSettings.folder === "string" ? parsedSettings.folder.trim() : "";
+      const format = typeof parsedSettings.format === "string" ? parsedSettings.format.trim() : "";
+      if (!format) {
+        return null;
+      }
+      return { folder, format };
+    } catch (e) {
+      return null;
+    }
+  }
+  async getDailyNotesSettings() {
+    var _a;
+    return (_a = this.getRuntimeDailyNotesSettings()) != null ? _a : await this.readDailyNotesSettingsFile();
+  }
+  getReusableNoteContent() {
+    return this.settings.defaultNoteContent.replace(
       "{{date}}",
       currentMoment().format("YYYY-MM-DD")
     );
-    await this.ensureFolderExists(folder);
-    return await this.app.vault.create(path, content);
+  }
+  getReusableFocusTargetPath(reusablePaths, primaryPath) {
+    const rememberedPath = this.normalizeReusableNotePath(
+      this.settings.lastFocusedReusableNotePath
+    );
+    if (rememberedPath && reusablePaths.includes(rememberedPath)) {
+      return rememberedPath;
+    }
+    return primaryPath;
+  }
+  normalizeReusableNotePath(path) {
+    const trimmedPath = path.trim().replace(/^\/+/, "");
+    if (!trimmedPath) {
+      return "";
+    }
+    return trimmedPath.endsWith(".md") ? trimmedPath : `${trimmedPath}.md`;
+  }
+  normalizeExtraReusableNotePaths(paths) {
+    if (!Array.isArray(paths)) {
+      return [];
+    }
+    const normalizedPaths = /* @__PURE__ */ new Set();
+    for (const path of paths) {
+      if (typeof path !== "string") {
+        continue;
+      }
+      const normalizedPath = this.normalizeReusableNotePath(path);
+      if (!normalizedPath) {
+        continue;
+      }
+      normalizedPaths.add(normalizedPath);
+    }
+    return Array.from(normalizedPaths);
+  }
+  getFolderFromPath(path) {
+    const lastSlashIndex = path.lastIndexOf("/");
+    return lastSlashIndex === -1 ? "" : path.slice(0, lastSlashIndex);
   }
   async ensureFolderExists(folder) {
     if (!folder)
@@ -199,9 +1086,12 @@ var FloatingNotePlugin = class extends import_obsidian.Plugin {
     this.settings = { ...DEFAULT_SETTINGS };
     if (savedData && typeof savedData === "object" && !Array.isArray(savedData)) {
       const data = savedData;
-      for (const key of ["noteFolder", "noteTitleFormat", "defaultNoteContent"]) {
+      for (const key of ["noteFolder", "noteTitleFormat", "defaultNoteContent", "globalShortcut", "lastFocusedReusableNotePath"]) {
         if (typeof data[key] === "string")
           this.settings[key] = data[key];
+      }
+      if (Array.isArray(data.extraReusableNotePaths)) {
+        this.settings.extraReusableNotePaths = this.normalizeExtraReusableNotePaths(data.extraReusableNotePaths);
       }
       if (typeof data.alwaysOnTop === "boolean") {
         this.settings.alwaysOnTop = data.alwaysOnTop;
@@ -234,9 +1124,34 @@ var FloatingNotePlugin = class extends import_obsidian.Plugin {
       this.settings.noteTitleFormat = "[Note]";
       migrated = true;
     }
+    if (typeof this.settings.globalShortcut !== "string") {
+      this.settings.globalShortcut = DEFAULT_SETTINGS.globalShortcut;
+      migrated = true;
+    }
     if (this.settings.defaultNoteContent === LEGACY_DEFAULT_SETTINGS.defaultNoteContent) {
       this.settings.defaultNoteContent = DEFAULT_SETTINGS.defaultNoteContent;
       migrated = true;
+    }
+    const normalizedExtraReusableNotePaths = this.normalizeExtraReusableNotePaths(
+      this.settings.extraReusableNotePaths
+    );
+    if (!Array.isArray(this.settings.extraReusableNotePaths) || normalizedExtraReusableNotePaths.length !== this.settings.extraReusableNotePaths.length || normalizedExtraReusableNotePaths.some(
+      (path, index) => path !== this.settings.extraReusableNotePaths[index]
+    )) {
+      this.settings.extraReusableNotePaths = normalizedExtraReusableNotePaths;
+      migrated = true;
+    }
+    if (typeof this.settings.lastFocusedReusableNotePath !== "string") {
+      this.settings.lastFocusedReusableNotePath = DEFAULT_SETTINGS.lastFocusedReusableNotePath;
+      migrated = true;
+    } else {
+      const normalizedLastFocusedPath = this.normalizeReusableNotePath(
+        this.settings.lastFocusedReusableNotePath
+      );
+      if (normalizedLastFocusedPath !== this.settings.lastFocusedReusableNotePath) {
+        this.settings.lastFocusedReusableNotePath = normalizedLastFocusedPath;
+        migrated = true;
+      }
     }
     if (migrated) {
       await this.saveSettings();
@@ -244,6 +1159,20 @@ var FloatingNotePlugin = class extends import_obsidian.Plugin {
   }
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+  async updateExtraReusableNotePaths(value) {
+    this.settings.extraReusableNotePaths = this.normalizeExtraReusableNotePaths(
+      value.split("\n")
+    );
+    await this.saveSettings();
+  }
+  async rememberLastFocusedReusableNote(path) {
+    const normalizedPath = this.normalizeReusableNotePath(path);
+    if (!normalizedPath || this.settings.lastFocusedReusableNotePath === normalizedPath) {
+      return;
+    }
+    this.settings.lastFocusedReusableNotePath = normalizedPath;
+    await this.saveSettings();
   }
 };
 var FloatingNoteSettingTab = class extends import_obsidian.PluginSettingTab {
@@ -268,6 +1197,16 @@ var FloatingNoteSettingTab = class extends import_obsidian.PluginSettingTab {
             name: "New note title format",
             desc: "Moment.js date format for new notes opened via 'Open new note'. Wrap plain text in square brackets (e.g. [Note]).",
             control: { type: "text", key: "noteTitleFormat", placeholder: "[Quick] - YYYY-MM-DD HH[h]mm" }
+          },
+          {
+            name: "Global shortcut",
+            desc: "Electron accelerator that toggles the reusable quick note from any app. Use values like Ctrl+` or Cmd+Shift+Space. Leave blank to disable.",
+            render: (setting) => this.renderGlobalShortcut(setting)
+          },
+          {
+            name: "Additional reusable notes",
+            desc: "Vault-relative note paths to open alongside the reusable note, one per line. These only open with 'Toggle reusable quick note (floating)'.",
+            render: (setting) => this.renderExtraReusableNotePaths(setting)
           },
           {
             name: "Default note content",
@@ -302,30 +1241,48 @@ var FloatingNoteSettingTab = class extends import_obsidian.PluginSettingTab {
       }
     ];
   }
+  renderGlobalShortcut(setting) {
+    setting.addText(
+      (text) => text.setPlaceholder("Ctrl+`").setValue(this.plugin.settings.globalShortcut).onChange(async (value) => {
+        await this.plugin.updateGlobalShortcut(value);
+      })
+    );
+  }
+  renderExtraReusableNotePaths(setting) {
+    setting.addTextArea(
+      (text) => text.setPlaceholder("Ideas.md\nProjects/Ideas.md").setValue(this.plugin.settings.extraReusableNotePaths.join("\n")).onChange(async (value) => {
+        await this.plugin.updateExtraReusableNotePaths(value);
+      })
+    );
+  }
   display() {
     const { containerEl } = this;
     containerEl.empty();
     new import_obsidian.Setting(containerEl).setName("Note preferences").setHeading();
-    new import_obsidian.Setting(containerEl).setName("Notes folder").setDesc("Folder where quick notes are saved. Leave blank for vault root.").addText(
+    new import_obsidian.Setting(containerEl).setName("Notes folder").setDesc(
+      "Folder where new quick notes are saved. Leave blank for vault root. Reusable quick notes follow Daily Notes settings when available."
+    ).addText(
       (text) => text.setPlaceholder("Quick notes").setValue(this.plugin.settings.noteFolder).onChange(async (value) => {
         this.plugin.settings.noteFolder = value;
         await this.plugin.saveSettings();
       })
     );
     new import_obsidian.Setting(containerEl).setName("New note title format").setDesc(
-      "Moment.js date format for new notes opened via 'Open new note'. Wrap plain text in square brackets (e.g. [Note])."
+      "Moment.js date format for notes opened via 'Open new note'. Wrap plain text in square brackets (e.g. [Note])."
     ).addText(
       (text) => text.setPlaceholder("[Quick] - YYYY-MM-DD HH[h]mm").setValue(this.plugin.settings.noteTitleFormat).onChange(async (value) => {
         this.plugin.settings.noteTitleFormat = value;
         await this.plugin.saveSettings();
       })
     );
+    this.renderGlobalShortcut(new import_obsidian.Setting(containerEl).setName("Global shortcut").setDesc("Electron accelerator that toggles the reusable quick note from any app. Use values like Ctrl+` or Cmd+Shift+Space. Leave blank to disable."));
     new import_obsidian.Setting(containerEl).setName("Default note content").setDesc("Template for new notes. Use {{date}} for the current date/time.").addTextArea(
       (text) => text.setValue(this.plugin.settings.defaultNoteContent).onChange(async (value) => {
         this.plugin.settings.defaultNoteContent = value;
         await this.plugin.saveSettings();
       })
     );
+    this.renderExtraReusableNotePaths(new import_obsidian.Setting(containerEl).setName("Additional reusable notes").setDesc("Vault-relative note paths to open alongside the reusable note, one per line. These only open with 'Toggle reusable quick note (floating)'."));
     new import_obsidian.Setting(containerEl).setName("Window").setHeading();
     new import_obsidian.Setting(containerEl).setName("Always on top").setDesc("Keep the floating note window above other windows.").addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.alwaysOnTop).onChange(async (value) => {
