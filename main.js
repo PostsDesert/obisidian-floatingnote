@@ -90,13 +90,15 @@ var FloatingNotePlugin = class extends import_obsidian.Plugin {
         void this.handleActiveLeafChange(leaf);
       })
     );
+    const settingsTab = new FloatingNoteSettingTab(this.app, this);
     this.register(() => {
+      settingsTab.hide();
       this.unregisterGlobalShortcut();
       this.unregisterFloatingWindowCloseGuard();
       this.clearFloatingSession();
     });
     this.registerGlobalShortcut();
-    this.addSettingTab(new FloatingNoteSettingTab(this.app, this));
+    this.addSettingTab(settingsTab);
   }
   async openFloatingNote(createNew, source = "command") {
     this.debugLog("openFloatingNote:start", { createNew, source });
@@ -874,6 +876,8 @@ var FloatingNotePlugin = class extends import_obsidian.Plugin {
     if (globalShortcut && accelerator) {
       try {
         if (!globalShortcut.register(accelerator, () => {
+          if (this.registeredGlobalShortcut !== accelerator)
+            return;
           this.debugLog("globalShortcut:triggered", { accelerator });
           void this.openFloatingNote(false, "global");
         })) {
@@ -926,6 +930,12 @@ var FloatingNotePlugin = class extends import_obsidian.Plugin {
       globalShortcut.unregister(this.registeredGlobalShortcut);
     }
     this.registeredGlobalShortcut = null;
+  }
+  suspendGlobalShortcut() {
+    this.unregisterGlobalShortcut();
+  }
+  restoreGlobalShortcut() {
+    this.registerGlobalShortcut();
   }
   async updateGlobalShortcut(value) {
     const accelerator = value.trim();
@@ -1179,6 +1189,7 @@ var FloatingNotePlugin = class extends import_obsidian.Plugin {
 var FloatingNoteSettingTab = class extends import_obsidian.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
+    this.stopShortcutRecording = null;
     this.plugin = plugin;
   }
   // Obsidian 1.13+ indexes these controls for search and persists their values.
@@ -1242,13 +1253,18 @@ var FloatingNoteSettingTab = class extends import_obsidian.PluginSettingTab {
       }
     ];
   }
+  hide() {
+    var _a;
+    (_a = this.stopShortcutRecording) == null ? void 0 : _a.call(this);
+  }
   renderGlobalShortcut(setting) {
     const currentLabel = () => this.plugin.settings.globalShortcut || "Record shortcut";
-    let recording = false;
     let refreshLabel;
     const saveShortcut = async (accelerator) => {
       try {
-        await this.plugin.updateGlobalShortcut(accelerator);
+        if (!await this.plugin.updateGlobalShortcut(accelerator)) {
+          this.plugin.restoreGlobalShortcut();
+        }
       } catch (e) {
         new import_obsidian.Notice("Could not save the system-wide shortcut.");
       } finally {
@@ -1256,34 +1272,63 @@ var FloatingNoteSettingTab = class extends import_obsidian.PluginSettingTab {
       }
     };
     setting.addButton((record) => {
-      record.setButtonText(currentLabel()).setTooltip("Record system-wide shortcut");
-      const stopRecording = () => {
-        recording = false;
+      refreshLabel = () => {
         record.setButtonText(currentLabel());
       };
-      refreshLabel = stopRecording;
+      refreshLabel();
+      record.setTooltip("Record system-wide shortcut");
+      let scope = null;
+      let captured = null;
+      const finish = (accelerator) => {
+        if (!scope)
+          return;
+        this.app.keymap.popScope(scope);
+        scope = null;
+        captured = null;
+        this.stopShortcutRecording = null;
+        refreshLabel == null ? void 0 : refreshLabel();
+        if (accelerator === void 0) {
+          this.plugin.restoreGlobalShortcut();
+        } else {
+          void saveShortcut(accelerator);
+        }
+      };
+      const cancel = () => finish();
       record.onClick(() => {
-        recording = true;
+        var _a;
+        if (scope)
+          return;
+        (_a = this.stopShortcutRecording) == null ? void 0 : _a.call(this);
+        this.plugin.suspendGlobalShortcut();
+        scope = new import_obsidian.Scope();
+        scope.register(null, null, (event) => {
+          if (event.key === "Tab" && !captured)
+            return;
+          if (event.key === "Escape") {
+            cancel();
+            return false;
+          }
+          if (!captured && !event.repeat && !event.isComposing) {
+            const accelerator = this.getRecordedAccelerator(event);
+            if (accelerator) {
+              captured = { accelerator, code: event.code, key: event.key };
+            }
+          }
+          return false;
+        });
+        this.app.keymap.pushScope(scope);
+        this.stopShortcutRecording = cancel;
         record.setButtonText("Press shortcut\u2026");
         record.buttonEl.focus();
       });
-      record.buttonEl.addEventListener("blur", stopRecording);
-      record.buttonEl.addEventListener("keydown", (event) => {
-        if (!recording || event.key === "Tab")
+      record.buttonEl.addEventListener("blur", cancel);
+      record.buttonEl.addEventListener("keyup", (event) => {
+        if (!captured)
+          return;
+        if (captured.code ? captured.code !== event.code : captured.key !== event.key)
           return;
         event.preventDefault();
-        event.stopPropagation();
-        if (event.key === "Escape") {
-          stopRecording();
-          return;
-        }
-        if (event.repeat || event.isComposing)
-          return;
-        const accelerator = this.getRecordedAccelerator(event);
-        if (!accelerator)
-          return;
-        stopRecording();
-        void saveShortcut(accelerator);
+        finish(captured.accelerator);
       });
     });
     setting.addButton((clear) => clear.setButtonText("Clear").onClick(() => saveShortcut("")));

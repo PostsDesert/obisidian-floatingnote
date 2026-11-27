@@ -361,8 +361,14 @@ describe("updateGlobalShortcut", () => {
 describe("system-wide shortcut recorder", () => {
     it("records a key combo and lets Escape cancel another recording", async () => {
         const plugin = makePlugin();
-        await plugin.loadSettings();
-        const update = jest.spyOn(plugin, "updateGlobalShortcut").mockResolvedValue(true);
+        globalShortcut.register.mockReturnValue(true);
+        await plugin.onload();
+        const update = jest.spyOn(plugin, "updateGlobalShortcut");
+        const keymap = plugin.app.keymap as unknown as { pushScope: jest.Mock; popScope: jest.Mock };
+        const latestHandler = () => {
+            const scope = keymap.pushScope.mock.lastCall?.[0] as { register: jest.Mock };
+            return scope.register.mock.calls[0][2] as (event: Partial<KeyboardEvent>) => void;
+        };
         const tab = new FloatingNoteSettingTab(plugin.app, plugin);
         const row = tab.getSettingDefinitions()[0].items.find(item => item.name === "Global shortcut");
         if (!row || !("render" in row) || !row.render) throw new Error("Missing global shortcut setting");
@@ -390,18 +396,26 @@ describe("system-wide shortcut recorder", () => {
         const startRecording = button.onClick.mock.calls[0][0] as () => void;
         startRecording();
         expect(button.setButtonText).toHaveBeenLastCalledWith("Press shortcut…");
-        buttonEl.dispatchEvent(Object.assign(new Event("keydown"), { key: "Escape" }));
+        expect(globalShortcut.unregister).toHaveBeenLastCalledWith("Ctrl+`");
+        const queuedShortcut = globalShortcut.register.mock.lastCall?.[1] as () => void;
+        const openNote = jest.spyOn(plugin, "openFloatingNote");
+        queuedShortcut();
+        expect(openNote).not.toHaveBeenCalled();
+        latestHandler()({ key: "Escape" });
+        expect(globalShortcut.register).toHaveBeenLastCalledWith("Ctrl+`", expect.any(Function));
         expect(update).not.toHaveBeenCalled();
 
         startRecording();
-        buttonEl.dispatchEvent(Object.assign(new Event("keydown"), { key: "Shift", shiftKey: true }));
+        latestHandler()({ key: "Control", ctrlKey: true });
         expect(update).not.toHaveBeenCalled();
-        buttonEl.dispatchEvent(Object.assign(new Event("keydown"), {
-            key: " ",
-            metaKey: true,
-            shiftKey: true,
-        }));
-        expect(update).toHaveBeenCalledWith("Command+Shift+Space");
+        latestHandler()({ key: "`", code: "Backquote", ctrlKey: true });
+        latestHandler()({ key: "`", code: "Backquote", ctrlKey: true, repeat: true });
+        expect(update).not.toHaveBeenCalled();
+        buttonEl.dispatchEvent(Object.assign(new Event("keyup"), { key: "`", code: "Backquote" }));
+        expect(update).toHaveBeenCalledWith("Ctrl+`");
+        expect(globalShortcut.register).toHaveBeenLastCalledWith("Ctrl+`", expect.any(Function));
+        expect(openNote).not.toHaveBeenCalled();
+        expect(keymap.popScope).toHaveBeenCalledTimes(2);
     });
 });
 

@@ -4,6 +4,7 @@ import {
   Notice,
   Plugin,
   PluginSettingTab,
+  Scope,
   Setting,
   TFile,
   WorkspaceLeaf,
@@ -261,7 +262,9 @@ export default class FloatingNotePlugin extends Plugin {
         void this.handleActiveLeafChange(leaf);
       })
     );
+    const settingsTab = new FloatingNoteSettingTab(this.app, this);
     this.register(() => {
+      settingsTab.hide();
       this.unregisterGlobalShortcut();
       this.unregisterFloatingWindowCloseGuard();
       this.clearFloatingSession();
@@ -269,7 +272,7 @@ export default class FloatingNotePlugin extends Plugin {
     this.registerGlobalShortcut();
 
     // Settings tab
-    this.addSettingTab(new FloatingNoteSettingTab(this.app, this));
+    this.addSettingTab(settingsTab);
   }
 
   async openFloatingNote(
@@ -1191,6 +1194,7 @@ export default class FloatingNotePlugin extends Plugin {
     if (globalShortcut && accelerator) {
       try {
         if (!globalShortcut.register(accelerator, () => {
+          if (this.registeredGlobalShortcut !== accelerator) return;
           this.debugLog("globalShortcut:triggered", { accelerator });
           void this.openFloatingNote(false, "global");
         })) {
@@ -1248,6 +1252,14 @@ export default class FloatingNotePlugin extends Plugin {
     }
 
     this.registeredGlobalShortcut = null;
+  }
+
+  suspendGlobalShortcut(): void {
+    this.unregisterGlobalShortcut();
+  }
+
+  restoreGlobalShortcut(): void {
+    this.registerGlobalShortcut();
   }
 
   async updateGlobalShortcut(value: string): Promise<boolean> {
@@ -1560,6 +1572,7 @@ export default class FloatingNotePlugin extends Plugin {
 
 export class FloatingNoteSettingTab extends PluginSettingTab {
   plugin: FloatingNotePlugin;
+  private stopShortcutRecording: (() => void) | null = null;
 
   constructor(app: App, plugin: FloatingNotePlugin) {
     super(app, plugin);
@@ -1628,13 +1641,18 @@ export class FloatingNoteSettingTab extends PluginSettingTab {
     ];
   }
 
+  hide(): void {
+    this.stopShortcutRecording?.();
+  }
+
   private renderGlobalShortcut(setting: Setting): void {
     const currentLabel = () => this.plugin.settings.globalShortcut || "Record shortcut";
-    let recording = false;
     let refreshLabel: (() => void) | undefined;
     const saveShortcut = async (accelerator: string) => {
       try {
-        await this.plugin.updateGlobalShortcut(accelerator);
+        if (!await this.plugin.updateGlobalShortcut(accelerator)) {
+          this.plugin.restoreGlobalShortcut();
+        }
       } catch {
         new Notice("Could not save the system-wide shortcut.");
       } finally {
@@ -1643,36 +1661,58 @@ export class FloatingNoteSettingTab extends PluginSettingTab {
     };
 
     setting.addButton((record) => {
-      record.setButtonText(currentLabel()).setTooltip("Record system-wide shortcut");
-      const stopRecording = () => {
-        recording = false;
-        record.setButtonText(currentLabel());
-      };
+      refreshLabel = () => { record.setButtonText(currentLabel()); };
+      refreshLabel();
+      record.setTooltip("Record system-wide shortcut");
 
-      refreshLabel = stopRecording;
+      let scope: Scope | null = null;
+      let captured: { accelerator: string; code: string; key: string } | null = null;
+      const finish = (accelerator?: string) => {
+        if (!scope) return;
+        this.app.keymap.popScope(scope);
+        scope = null;
+        captured = null;
+        this.stopShortcutRecording = null;
+        refreshLabel?.();
+
+        if (accelerator === undefined) {
+          this.plugin.restoreGlobalShortcut();
+        } else {
+          void saveShortcut(accelerator);
+        }
+      };
+      const cancel = () => finish();
 
       record.onClick(() => {
-        recording = true;
+        if (scope) return;
+        this.stopShortcutRecording?.();
+        this.plugin.suspendGlobalShortcut();
+        scope = new Scope();
+        scope.register(null, null, (event) => {
+          if (event.key === "Tab" && !captured) return;
+          if (event.key === "Escape") {
+            cancel();
+            return false;
+          }
+          if (!captured && !event.repeat && !event.isComposing) {
+            const accelerator = this.getRecordedAccelerator(event);
+            if (accelerator) {
+              captured = { accelerator, code: event.code, key: event.key };
+            }
+          }
+          return false;
+        });
+        this.app.keymap.pushScope(scope);
+        this.stopShortcutRecording = cancel;
         record.setButtonText("Press shortcut…");
         record.buttonEl.focus();
       });
-      record.buttonEl.addEventListener("blur", stopRecording);
-      record.buttonEl.addEventListener("keydown", (event) => {
-        if (!recording || event.key === "Tab") return;
-
+      record.buttonEl.addEventListener("blur", cancel);
+      record.buttonEl.addEventListener("keyup", (event) => {
+        if (!captured) return;
+        if (captured.code ? captured.code !== event.code : captured.key !== event.key) return;
         event.preventDefault();
-        event.stopPropagation();
-        if (event.key === "Escape") {
-          stopRecording();
-          return;
-        }
-        if (event.repeat || event.isComposing) return;
-
-        const accelerator = this.getRecordedAccelerator(event);
-        if (!accelerator) return;
-
-        stopRecording();
-        void saveShortcut(accelerator);
+        finish(captured.accelerator);
       });
     });
     setting.addButton((clear) => clear.setButtonText("Clear").onClick(() => saveShortcut("")));

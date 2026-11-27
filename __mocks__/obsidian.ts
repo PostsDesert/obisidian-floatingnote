@@ -336,7 +336,12 @@ export class WorkspaceLeaf {
 }
 
 // ── App stub ──────────────────────────────────────────────────────────────
+export class Scope {
+    register = jest.fn();
+}
+
 export class App {
+    keymap = { pushScope: jest.fn(), popScope: jest.fn() };
     private leafById = new Map<string, WorkspaceLeaf>();
     private workspaceHandlers = new Map<WorkspaceEventName, Set<(...args: any[]) => void>>();
     workspace: {
